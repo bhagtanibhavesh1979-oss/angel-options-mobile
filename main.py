@@ -9,13 +9,14 @@ import json
 from datetime import datetime, timedelta, time as dt_time
 
 # --- THEME COLORS ---
-BG_COLOR = "#111418"
-CARD_COLOR = "#1E2329"
-TEXT_WHITE = "#F0F0F0"
-TEXT_GREY = "#616161"
-ACCENT_GREEN = "#00FF7F"    # Spring Green
-ACCENT_BLUE = "#2979FF"
-ACCENT_GOLD = "#FFD700"
+BG_COLOR = "#000000"        # Pure Black
+CARD_COLOR = "#121212"      # OLED Dark Grey
+TEXT_WHITE = "#FFFFFF"
+TEXT_GREY = "#9E9E9E"
+ACCENT_GREEN = "#00E676"    # Profit/Call
+ACCENT_RED = "#FF5252"      # Loss/Put
+ACCENT_BLUE = "#2979FF"     # Info
+ACCENT_GOLD = "#FFC107"     # Fair Value Highlight
 
 # --- CONSTANTS ---
 API_BASE = "https://apiconnect.angelbroking.com/rest"
@@ -26,14 +27,15 @@ INSTRUMENTS = {
     "BANKNIFTY": ("NSE", "99926009"),
     "FINNIFTY": ("NSE", "99926037"),
     "SENSEX": ("BSE", "99919000"),
-    "RELIANCE": ("NSE", "2885"),
-    "HDFCBANK": ("NSE", "1333"),
-    "SBIN": ("NSE", "3045"),
-    "TCS": ("NSE", "11536"),
-    "INFY": ("NSE", "1594")
+    "MIDCPNIFTY": ("NSE", "99926074")
 }
 
-# --- MATH ---
+# --- MATH ENGINE (PURE PYTHON) ---
+PI = 3.141592653589793
+
+def norm_pdf(x):
+    return (1.0 / math.sqrt(2 * PI)) * math.exp(-0.5 * x * x)
+
 def norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
@@ -52,7 +54,26 @@ def black_scholes_price(S, K, T, r, sigma, option_type="CE"):
     else:
         return K * math.exp(-r * T) * norm_cdf(-d2) - S * norm_cdf(-d1)
 
-# --- STATE ---
+def calculate_delta(S, K, T, r, sigma, option_type="CE"):
+    d1, _ = d1_d2(S, K, T, r, sigma)
+    if d1 is None: return 0.0
+    if option_type == "CE": return norm_cdf(d1)
+    else: return norm_cdf(d1) - 1.0
+
+def calculate_implied_volatility(price, S, K, T, r, option_type="CE"):
+    v = 0.5 
+    for i in range(5): 
+        p = black_scholes_price(S, K, T, r, v, option_type)
+        d1, _ = d1_d2(S, K, T, r, v)
+        if d1 is None: break
+        vega = S * math.sqrt(T) * norm_pdf(d1)
+        diff = price - p
+        if abs(diff) < 0.01: return v
+        if abs(vega) < 0.00001: break 
+        v = v + diff / vega
+    return max(0.01, v)
+
+# --- STATE MANAGEMENT ---
 class AppState:
     jwt_token = None
     headers = None
@@ -61,9 +82,9 @@ class AppState:
     auto_refresh = False
     
     # SETTINGS
-    risk_free_rate = 0.07
+    risk_free_rate = 0.10
     model_iv = 0.15
-    strike_count = 8
+    strike_count = 6  # Default 6 above, 6 below (13 rows total)
     alert_threshold = 5.0
 
 state = AppState()
@@ -94,7 +115,7 @@ def load_token_master(log_func=None):
         except: pass
 
     try:
-        if log_func: log_func("Downloading Master...")
+        if log_func: log_func("Downloading Master (50MB)...")
         url = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
         r = requests.get(url, timeout=90) 
         data = r.json()
@@ -126,24 +147,23 @@ def get_spot_price(symbol):
         d = r.json()
         if d.get("status"):
             ltp = float(d['data']['fetched'][0]['ltp'])
-            if symbol in ["NIFTY", "FINNIFTY"] and ltp > 100000: ltp /= 10
+            if symbol in ["NIFTY", "FINNIFTY", "MIDCPNIFTY"] and ltp > 100000: ltp /= 10
             elif symbol == "BANKNIFTY" and ltp > 200000: ltp /= 10
             elif symbol == "SENSEX" and ltp > 200000: ltp /= 10
             return ltp
     except: pass
     return 0.0
 
-def get_batch_quotes(tokens, exchange="NFO", log_func=None):
+def get_batch_quotes(tokens, exchange="NFO"):
     results = {}
-    chunk_size = 10
+    chunk_size = 20
     str_tokens = [str(t).strip() for t in tokens]
     for i in range(0, len(str_tokens), chunk_size):
         chunk = str_tokens[i:i + chunk_size]
         url = f"{API_BASE}/secure/angelbroking/market/v1/quote/"
         payload = {"mode": "FULL", "exchangeTokens": {exchange: chunk}}
         try:
-            time.sleep(0.25)
-            r = requests.post(url, json=payload, headers=state.headers, timeout=5)
+            r = requests.post(url, json=payload, headers=state.headers, timeout=3)
             d = r.json()
             if d.get("status") and 'fetched' in d['data']:
                 for item in d['data']['fetched']:
@@ -172,17 +192,45 @@ def get_expiries(symbol):
     return valid[:6] if valid else exps_list[-5:]
 
 def get_chain_data(symbol, expiry, spot):
+    """
+    Returns a symmetric list of tokens around the Spot price.
+    Eg: 5 strikes below ATM, ATM, 5 strikes above ATM.
+    """
     if spot == 0 or not expiry: return []
-    subset = []
+    
+    # 1. Get all strikes for this expiry
+    candidates = []
     for item in state.master_data:
         if item.get('name') == symbol and item.get('expiry') == expiry:
-            item['diff'] = abs(item['strike_real'] - spot)
-            subset.append(item)
-    subset.sort(key=lambda x: x['diff'])
-    limit = state.strike_count * 4 
-    top = subset[:limit]
-    top.sort(key=lambda x: x['strike_real'])
-    return top
+            candidates.append(item)
+    
+    if not candidates: return []
+
+    # 2. Extract unique strikes and sort
+    unique_strikes = sorted(list(set(x['strike_real'] for x in candidates)))
+    if not unique_strikes: return []
+
+    # 3. Find ATM Index (Closest to Spot)
+    atm_index = 0
+    min_diff = float('inf')
+    for i, s in enumerate(unique_strikes):
+        diff = abs(s - spot)
+        if diff < min_diff:
+            min_diff = diff
+            atm_index = i
+            
+    # 4. Slice symmetrically
+    count = state.strike_count
+    start_idx = max(0, atm_index - count)
+    end_idx = min(len(unique_strikes), atm_index + count + 1)
+    
+    selected_strikes = unique_strikes[start_idx:end_idx]
+
+    # 5. Filter the original candidates to just these strikes
+    final_data = [x for x in candidates if x['strike_real'] in selected_strikes]
+    final_data.sort(key=lambda x: x['strike_real'])
+    
+    return final_data
 
 # --- MAIN APP ---
 def main(page: ft.Page):
@@ -191,15 +239,23 @@ def main(page: ft.Page):
     page.theme_mode = "dark"
     page.padding = 0 
     
-    def show_msg(msg, color=ACCENT_GREEN):
-        page.snack_bar = ft.SnackBar(
-            ft.Text(msg, color="#000000", weight="bold"), 
-            bgcolor=color
-        )
+    # --- GLOBAL UI ---
+    progress_bar = ft.ProgressBar(width=None, color=ACCENT_BLUE, bgcolor="#333333", visible=False)
+    
+    def show_snack(msg, color=ACCENT_GREEN):
+        page.snack_bar = ft.SnackBar(ft.Text(msg, color="black", weight="bold"), bgcolor=color)
         page.snack_bar.open = True
         page.update()
 
-    # --- LOGIN ---
+    def show_alert(title, msg):
+        dlg = ft.AlertDialog(
+            title=ft.Text(title),
+            content=ft.Text(msg),
+            actions=[ft.TextButton("OK", on_click=lambda e: page.close(dlg))]
+        )
+        page.open(dlg)
+
+    # --- LOGIN SCREEN ---
     api_input = ft.TextField(label="API Key", password=True, text_size=12, border_color=TEXT_GREY)
     client_input = ft.TextField(label="Client Code", text_size=12, border_color=TEXT_GREY)
     pin_input = ft.TextField(label="PIN", password=True, text_size=12, border_color=TEXT_GREY)
@@ -207,33 +263,42 @@ def main(page: ft.Page):
     login_btn = ft.ElevatedButton("Secure Login", bgcolor=ACCENT_BLUE, color="white", height=45)
     login_status = ft.Text("", color=ACCENT_GOLD, size=12)
 
-    # --- HOME ---
-    spot_display = ft.Text("0.00", size=30, weight="bold", color=TEXT_WHITE)
-    spot_label = ft.Text("SPOT PRICE", size=12, color=TEXT_GREY)
+    # --- HOME / CHAIN SCREEN ---
+    spot_display = ft.Text("0.00", size=24, weight="bold", color=TEXT_WHITE)
+    spot_label = ft.Text("SPOT", size=10, color=TEXT_GREY)
     
     idx_dd = ft.Dropdown(
         options=[ft.dropdown.Option(x) for x in INSTRUMENTS.keys()],
-        value="NIFTY", width=160, text_size=14, border_color=TEXT_GREY, bgcolor=CARD_COLOR, content_padding=10
+        value="NIFTY", text_size=14, border_color=TEXT_GREY, 
+        bgcolor=CARD_COLOR, content_padding=5, expand=True
     )
-    exp_dd = ft.Dropdown(width=160, text_size=14, border_color=TEXT_GREY, bgcolor=CARD_COLOR, content_padding=10)
+    exp_dd = ft.Dropdown(
+        text_size=14, border_color=TEXT_GREY, 
+        bgcolor=CARD_COLOR, content_padding=5, expand=True
+    )
     refresh_btn = ft.IconButton(icon="refresh", icon_color=ACCENT_BLUE, bgcolor=CARD_COLOR)
     auto_switch = ft.Switch(label="Auto", value=False, active_color=ACCENT_GREEN)
 
+    # UPDATED TABLE COLUMNS AS REQUESTED
+    # Order: CE LTP | Fair | Strike | PE LTP | Fair | IV | Delta
     chain_table = ft.DataTable(
         columns=[
-            ft.DataColumn(ft.Text("LTP", color=TEXT_GREY, weight="bold")),
-            ft.DataColumn(ft.Text("Fair", color=ACCENT_GOLD)),
-            ft.DataColumn(ft.Text("Strike", weight="bold", color=TEXT_WHITE)),
-            ft.DataColumn(ft.Text("LTP", color=TEXT_GREY, weight="bold")),
-            ft.DataColumn(ft.Text("Fair", color=ACCENT_GOLD)),
+            ft.DataColumn(ft.Text("CE LTP", color=TEXT_WHITE, size=11, weight="bold")),
+            ft.DataColumn(ft.Text("Fair", color=ACCENT_GOLD, size=11)),
+            ft.DataColumn(ft.Text("Strike", color=TEXT_WHITE, weight="bold", size=12)),
+            ft.DataColumn(ft.Text("PE LTP", color=TEXT_WHITE, size=11, weight="bold")),
+            ft.DataColumn(ft.Text("Fair", color=ACCENT_GOLD, size=11)),
+            ft.DataColumn(ft.Text("IV (C|P)", color=TEXT_GREY, size=10)),
+            ft.DataColumn(ft.Text("Δ (C|P)", color=TEXT_GREY, size=10)),
         ],
-        column_spacing=15, 
-        data_row_min_height=35,
-        heading_row_height=35,
+        column_spacing=10, # Compact spacing
+        data_row_min_height=40,
+        heading_row_height=40,
+        horizontal_lines=ft.border.BorderSide(0.5, "#333333"),
         rows=[]
     )
 
-    # --- CALCULATOR (TARGET PRICE) ---
+    # --- CALCULATOR COMPONENTS ---
     calc_type = ft.Dropdown(options=[ft.dropdown.Option("CE"), ft.dropdown.Option("PE")], value="CE", label="Type", width=100, bgcolor=CARD_COLOR)
     calc_spot = ft.TextField(label="Target Spot Price", value="24000", text_size=14, border_color=ACCENT_BLUE)
     calc_strike = ft.TextField(label="Strike Price", value="24000", text_size=14, border_color=TEXT_GREY)
@@ -249,17 +314,16 @@ def main(page: ft.Page):
             r = state.risk_free_rate
             v = float(calc_iv.value) / 100.0
             op = calc_type.value
-            
             fair = black_scholes_price(S, K, T, r, v, op)
             calc_res_price.value = f"₹{fair:.2f}"
             page.update()
         except: pass
 
-    # --- SETTINGS ---
-    set_rfr = ft.TextField(label="Interest Rate (%)", value=str(state.risk_free_rate*100), width=200)
-    set_iv = ft.TextField(label="Model Volatility (%)", value=str(state.model_iv*100), width=200)
-    set_alert = ft.TextField(label="Discount % for Buy Signal", value=str(state.alert_threshold), width=200)
-    set_strikes = ft.TextField(label="Strikes Count", value=str(state.strike_count), width=200)
+    # --- SETTINGS COMPONENTS ---
+    set_rfr = ft.TextField(label="Risk Free Rate (%)", value=str(state.risk_free_rate*100), width=150)
+    set_iv = ft.TextField(label="Fair Model IV (%)", value=str(state.model_iv*100), width=150)
+    set_alert = ft.TextField(label="Disc. Alert (%)", value=str(state.alert_threshold), width=150)
+    set_strikes = ft.TextField(label="Strike Count", value=str(state.strike_count), width=150)
 
     # --- LOGIC ---
     def update_expiries(e=None):
@@ -270,6 +334,7 @@ def main(page: ft.Page):
 
     def refresh_chain(e):
         if not state.master_data: return
+        progress_bar.visible = True
         spot_display.color = TEXT_GREY
         page.update()
 
@@ -278,11 +343,15 @@ def main(page: ft.Page):
         spot_display.color = TEXT_WHITE
         
         if not exp_dd.value: 
+            progress_bar.visible = False
             page.update()
             return
 
         chain = get_chain_data(idx_dd.value, exp_dd.value, spot)
-        if not chain: return
+        if not chain:
+            progress_bar.visible = False
+            page.update()
+            return
 
         nfo = [x['token'] for x in chain if x['exch_seg'] == 'NFO']
         bfo = [x['token'] for x in chain if x['exch_seg'] == 'BFO']
@@ -291,7 +360,7 @@ def main(page: ft.Page):
         if bfo: quotes.update(get_batch_quotes(bfo, 'BFO'))
 
         rows = []
-        buy_count = 0
+        opportunities = []
         
         try:
             ed = datetime.strptime(exp_dd.value, "%d%b%Y")
@@ -303,7 +372,7 @@ def main(page: ft.Page):
             m_iv = float(set_iv.value) / 100.0
             alert_th = float(set_alert.value) / 100.0
         except: 
-            r_rate, m_iv, alert_th = 0.07, 0.15, 0.05
+            r_rate, m_iv, alert_th = 0.10, 0.15, 0.05
 
         strikes = sorted(list(set(x['strike_real'] for x in chain)))
         step = 50
@@ -313,61 +382,80 @@ def main(page: ft.Page):
             ce = next((x for x in chain if x['strike_real'] == K and "CE" in x['symbol']), None)
             pe = next((x for x in chain if x['strike_real'] == K and "PE" in x['symbol']), None)
             
-            ltp_c, ltp_p = 0, 0
-            if ce: ltp_c = quotes.get(ce['token'], 0)
-            if pe: ltp_p = quotes.get(pe['token'], 0)
+            ltp_c = quotes.get(ce['token'], 0) if ce else 0
+            ltp_p = quotes.get(pe['token'], 0) if pe else 0
             
             fair_c = black_scholes_price(spot, K, T, r_rate, m_iv, "CE")
             fair_p = black_scholes_price(spot, K, T, r_rate, m_iv, "PE")
             
-            fc_color = TEXT_GREY
-            if ltp_c > 0 and fair_c > ltp_c * (1 + alert_th): 
-                fc_color = ACCENT_GREEN 
-                buy_count += 1
+            delta_c = calculate_delta(spot, K, T, r_rate, m_iv, "CE")
+            delta_p = calculate_delta(spot, K, T, r_rate, m_iv, "PE")
             
-            fp_color = TEXT_GREY
-            if ltp_p > 0 and fair_p > ltp_p * (1 + alert_th): 
-                fp_color = ACCENT_GREEN 
-                buy_count += 1
+            iv_c = calculate_implied_volatility(ltp_c, spot, K, T, r_rate, "CE") if ltp_c > 0 else 0
+            iv_p = calculate_implied_volatility(ltp_p, spot, K, T, r_rate, "PE") if ltp_p > 0 else 0
 
+            # COLORS
+            c_col = TEXT_WHITE
+            if ltp_c > 0 and fair_c > ltp_c * (1 + alert_th): 
+                c_col = ACCENT_GREEN
+                opportunities.append(f"CALL {int(K)}")
+            
+            p_col = TEXT_WHITE
+            if ltp_p > 0 and fair_p > ltp_p * (1 + alert_th): 
+                p_col = ACCENT_GREEN 
+                opportunities.append(f"PUT {int(K)}")
+
+            # Highlight ATM
             is_atm = abs(spot - K) < (step / 1.8)
-            bg = "#263238" if is_atm else None
+            bg = "#212121" if is_atm else None
 
             rows.append(ft.DataRow(
                 color=bg,
                 cells=[
-                    ft.DataCell(ft.Text(f"{ltp_c:.2f}", color=ACCENT_GREEN if fc_color == ACCENT_GREEN else TEXT_GREY, weight="bold", size=13)),
+                    ft.DataCell(ft.Text(f"{ltp_c:.2f}", color=c_col, weight="bold", size=12)),
                     ft.DataCell(ft.Text(f"{fair_c:.0f}", color=ACCENT_GOLD, size=12)), 
                     ft.DataCell(ft.Text(str(int(K)), weight="bold", size=13, color=TEXT_WHITE)),
-                    ft.DataCell(ft.Text(f"{ltp_p:.2f}", color=ACCENT_GREEN if fp_color == ACCENT_GREEN else TEXT_GREY, weight="bold", size=13)),
+                    ft.DataCell(ft.Text(f"{ltp_p:.2f}", color=p_col, weight="bold", size=12)),
                     ft.DataCell(ft.Text(f"{fair_p:.0f}", color=ACCENT_GOLD, size=12)), 
+                    
+                    # Compact IV and Delta
+                    ft.DataCell(ft.Text(f"{int(iv_c*100)} | {int(iv_p*100)}", color=TEXT_GREY, size=11)),
+                    ft.DataCell(ft.Text(f"{delta_c:.2f} | {delta_p:.2f}", color=ACCENT_BLUE, size=11)),
                 ]
             ))
-        chain_table.rows = rows
-        if buy_count > 0: show_msg(f"🔥 Found {buy_count} Buy Opportunities!", ACCENT_GREEN)
-        page.update()
 
-    def save_btn_click(e):
-        try:
-            state.risk_free_rate = float(set_rfr.value) / 100.0
-            state.model_iv = float(set_iv.value) / 100.0
-            state.alert_threshold = float(set_alert.value)
-            state.strike_count = int(set_strikes.value)
-            show_msg("Settings Saved")
-        except: pass
+        chain_table.rows = rows
+        progress_bar.visible = False
+        
+        if opportunities and not state.auto_refresh:
+            show_alert("Discount Alert!", f"Found valuable options:\n{', '.join(opportunities[:5])}")
+        elif opportunities:
+            show_snack(f"Found {len(opportunities)} Opportunities!", ACCENT_GREEN)
+            
+        page.update()
 
     def auto_loop():
         while state.auto_refresh:
             refresh_chain(None)
-            time.sleep(15)
+            time.sleep(10)
             
     def toggle_auto(e):
         state.auto_refresh = auto_switch.value
         if state.auto_refresh: threading.Thread(target=auto_loop, daemon=True).start()
     auto_switch.on_change = toggle_auto
 
+    def save_settings(e):
+        try:
+            state.risk_free_rate = float(set_rfr.value) / 100.0
+            state.model_iv = float(set_iv.value) / 100.0
+            state.alert_threshold = float(set_alert.value)
+            state.strike_count = int(set_strikes.value)
+            show_snack("Settings Saved")
+        except: show_snack("Invalid Settings", ACCENT_RED)
+
     def login_click(e):
         login_status.value = "Connecting..."
+        progress_bar.visible = True
         page.update()
         t = login_angel(api_input.value, client_input.value, pin_input.value, totp_input.value)
         if t:
@@ -384,52 +472,58 @@ def main(page: ft.Page):
                 body.content = tab_home
                 page.add(nav_bar)
                 update_expiries()
-                page.update()
             else:
                 login_status.value = "Master File Error"
         else:
             login_status.value = "Login Failed"
-            page.update()
+        progress_bar.visible = False
+        page.update()
     login_btn.on_click = login_click
 
     # --- LAYOUTS ---
     tab_login = ft.Container(
         content=ft.Column([
-            ft.Icon(name="lock_clock", size=50, color=ACCENT_BLUE),
-            ft.Text("Angel Buyer", size=24, weight="bold"),
+            ft.Icon(name="lock_clock", size=60, color=ACCENT_BLUE),
+            ft.Text("Angel Pro", size=28, weight="bold"),
             ft.Container(height=20),
             api_input, client_input, pin_input, totp_input,
             ft.Container(height=10),
-            login_btn, login_status
+            login_btn, login_status, progress_bar
         ], alignment="center", horizontal_alignment="center"),
         padding=30, alignment=ft.alignment.center
     )
 
     tab_home = ft.Container(
         content=ft.Column([
+            progress_bar,
             ft.Container(
-                content=ft.Column([spot_label, spot_display], horizontal_alignment="center"),
-                alignment=ft.alignment.center, padding=10
+                content=ft.Row([
+                    ft.Column([spot_label, spot_display], spacing=0),
+                    ft.Column([auto_switch, refresh_btn], spacing=0, alignment="end")
+                ], alignment="spaceBetween"),
+                padding=10, bgcolor=CARD_COLOR, border_radius=10
             ),
-            ft.Row([idx_dd, exp_dd], alignment="center"),
-            ft.Row([auto_switch, refresh_btn], alignment="center"),
-            ft.Divider(color=CARD_COLOR),
-            ft.Column([chain_table], scroll=ft.ScrollMode.ADAPTIVE, expand=True)
+            ft.Row([idx_dd, exp_dd], spacing=10),
+            # HORIZONTAL SCROLL FOR TABLE
+            ft.Container(
+                content=ft.Row([chain_table], scroll=ft.ScrollMode.ALWAYS),
+                expand=True
+            )
         ]),
-        padding=5, expand=True
+        padding=10, expand=True
     )
 
     tab_calc = ft.Container(
         content=ft.Column([
-            ft.Text("Target Spot Calculator", size=20, weight="bold"),
-            ft.Text("Predict Option Price for future spot moves", size=10, color=TEXT_GREY),
+            ft.Text("Black-Scholes Calculator", size=20, weight="bold"),
+            ft.Text("Estimate option price based on future spot", size=11, color=TEXT_GREY),
             ft.Divider(),
             ft.Row([calc_type, calc_days, calc_iv]),
             calc_spot,
             calc_strike,
-            ft.ElevatedButton("Calculate Limit Price", on_click=calc_click, bgcolor=ACCENT_BLUE, color="white"),
+            ft.ElevatedButton("Calculate Fair Price", on_click=calc_click, bgcolor=ACCENT_BLUE, color="white"),
             ft.Container(height=20),
-            ft.Text("Fair Premium:", size=12, color=TEXT_GREY),
+            ft.Text("Fair Value:", size=12, color=TEXT_GREY),
             calc_res_price
         ], horizontal_alignment="center"),
         padding=20, expand=True
@@ -437,25 +531,20 @@ def main(page: ft.Page):
 
     tab_settings = ft.Container(
         content=ft.Column([
-            ft.Text("Buyer Settings", size=22, weight="bold"),
+            ft.Text("Settings", size=20, weight="bold"),
             ft.Divider(),
-            set_rfr,
-            ft.Text("Risk-Free Rate (Default 7%)", size=10, color=TEXT_GREY),
+            ft.Row([set_rfr, set_iv], alignment="spaceBetween"),
+            ft.Text("RFR = Risk Free Rate | IV = Model Volatility", size=10, color=TEXT_GREY),
             ft.Container(height=10),
-            set_iv,
-            ft.Text("Model Volatility (15%) - Drives Fair Value", size=10, color=TEXT_GREY),
-            ft.Container(height=10),
-            set_alert,
-            ft.Text("Discount % (e.g. 5 = Buy if LTP 5% < Fair)", size=10, color=TEXT_GREY),
-            ft.Container(height=10),
-            set_strikes,
+            ft.Row([set_alert, set_strikes], alignment="spaceBetween"),
+            ft.Text("Alert = Discount % for Green Signal", size=10, color=TEXT_GREY),
+            ft.Text("Strikes = Count above/below Spot", size=10, color=TEXT_GREY),
             ft.Container(height=20),
-            ft.ElevatedButton("Save Changes", on_click=save_btn_click, bgcolor=ACCENT_BLUE, color="white")
+            ft.ElevatedButton("Save Changes", on_click=save_settings, bgcolor=ACCENT_BLUE, color="white")
         ]),
         padding=20, expand=True
     )
 
-    # --- NAVIGATION ---
     body = ft.Container(content=tab_login, expand=True) 
 
     def nav_click(e):
@@ -472,7 +561,7 @@ def main(page: ft.Page):
             ft.IconButton(icon="settings", icon_color=ACCENT_BLUE, data="Settings", on_click=nav_click),
         ], alignment="spaceAround"),
         bgcolor=CARD_COLOR,
-        padding=10,
+        padding=5,
         border_radius=ft.border_radius.only(top_left=15, top_right=15)
     )
 
